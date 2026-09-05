@@ -1,0 +1,6 @@
+captures/*
+!captures/grab.sh
+!captures/grab_audio.py
+!captures/grab_spec10.sh
+work/
+uiq

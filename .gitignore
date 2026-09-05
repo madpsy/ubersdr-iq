@@ -1,0 +1,29 @@
+# Build products
+/uiq
+/cpp/conformance
+/cpp/example
+*.o
+
+# Working files from the examples
+*.rt
+
+# Python
+__pycache__/
+*.pyc
+
+# scratch reconstructions written by bench-sdrpp/run.sh
+bench-sdrpp/rec_*.pcm
+bench-sdrpp/iq-384k*_*.pcm
+bench-sdrpp/bench
+
+# bitdepth experiment scratch
+bitdepth/work/
+bitdepth/uiq
+
+# section 10.2 cost benchmark build products and unpacked captures
+bench-cost/bench
+bench-cost/bench-go
+bench-cost/bench-noleak
+bench-cost/sessions
+bench-cost/noleak/
+bench-cost/data/
