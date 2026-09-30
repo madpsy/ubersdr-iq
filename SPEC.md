@@ -911,7 +911,7 @@ its carriers sit 60 dB over the noise and it genuinely needs the depth.
 How a client *asks* for that margin is a matter for the transport, not for this
 format. In the deployment this format comes from it is a `min_margin` query
 parameter on the streaming URL — an integer number of decibels, absent or `0`
-meaning lossless, values outside 15–60 clamped rather than refused — and a
+meaning lossless, values outside 10–60 clamped rather than refused — and a
 control message of the same name to change it on a live connection. Those names
 and rules are documented with that transport; a stream carrying profile 2 says
 everything a decoder needs, whatever asked for it.

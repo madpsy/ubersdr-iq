@@ -9,12 +9,13 @@ measured; see captures/grab_spec10.sh for how they were taken and why those
 frequencies. Every figure printed here comes out of the codec in ../go, through
 `spec10/`, and every arm round trips before it is scored.
 
-The IQ streams get three arms, because profile 2 (§6.6) is now in production and
+The IQ streams get four arms, because profile 2 (§6.6) is now in production and
 a lossless-only table no longer describes what the receiver sends:
 
   lossless   profile 1, the complex predictor, nothing requantised
   m26        profile 2 at a 26 dB margin -- the reference sender's default
-  m15        profile 2 at a 15 dB margin -- the aggressive end of the range
+  m15        profile 2 at a 15 dB margin -- the aggressive arm
+  m10        profile 2 at a 10 dB margin -- the floor a client may ask for
 
 Demodulated audio gets the lossless arm alone. Profile 2 is complex-only: the
 encoder refuses it at one channel, so a margin arm for audio would be measuring
@@ -51,9 +52,10 @@ AUD = os.path.join(HERE, "captures", "audio")
 # packetisation has to be inferred.
 ORIG = os.path.join(WORK, "orig")
 
-# The margin the reference sender defaults to, and the floor of the range a
-# client may ask for (pcm_lossy.go: lossyMinMarginDB 15, lossyMaxMarginDB 60).
-MARGINS = (26, 15)
+# The margin the reference sender defaults to, an aggressive arm, and the floor
+# of the range a client may ask for (pcm_lossy.go: lossyMinMarginDB 10,
+# lossyMaxMarginDB 60).
+MARGINS = (26, 15, 10)
 
 # The receiver's own ceiling on quantiser depth, from pcm_lossy.go
 # (lossyMaxDepth). margin_rule.py's own default is 14, which predates it.

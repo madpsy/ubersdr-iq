@@ -126,15 +126,16 @@ The policy measured here is not invented for the benchmark: it is
 client asks for a **margin** in decibels — how far below the band's own noise
 floor the quantisation floor must be held — and the depth honouring it is worked
 out per packet from the packet's crest factor and the band's spectral peakiness.
-Two arms are run: **26 dB**, the reference default, and **15 dB**, the
-aggressive end of the range the reference sender accepts.
+Three arms are run: **26 dB**, the reference default, **15 dB**, an aggressive
+arm, and **10 dB**, the floor of the 10–60 the reference sender accepts.
 
 `shifts.py` runs `margin_rule.quantise_margin` and writes one shift byte per
 packet; `bench` hands each to `StreamEncoder::EncodeScaled`, so the
 quantisation itself is SPEC.md §6.6.2's and not a numpy experiment's. The two
 differ only in how they clamp, and only for a sample that rounding carries past
-the ceiling: on the 48 kHz capture that is 5 samples in 2,880,640 at 26 dB and
-26 at 15 dB, 0.0009% at worst, and none at all on the 384 kHz vectors.
+the ceiling: on the 48 kHz capture that is 5 samples in 2,880,640 at 26 dB, 26
+at 15 dB and 61 at 10 dB, 0.0021% at worst, and none at all on the 384 kHz
+vectors.
 
 ## Running it
 
@@ -164,6 +165,7 @@ approximation of them.
 | **UberSDR-IQ (lossless)** | **132.6** | **1.448×** | **yes** | exact | 0 | 0 | — |
 | **UberSDR-IQ, 26 dB margin** | **75.6** | **2.540×** | no | 47.2 dB | 64 | **0** | — |
 | **UberSDR-IQ, 15 dB margin** | **53.2** | **3.607×** | no | 35.9 dB | 256 | **0** | — |
+| **UberSDR-IQ, 10 dB margin** | **44.2** | **4.341×** | no | 31.0 dB | 512 | **0** | — |
 
 Two results, and the second is the new one.
 
@@ -177,14 +179,15 @@ without a caveat attached. At the reference sender's default margin it sends
 1.30× fewer bytes than int8 *and* returns a better reconstruction on every axis
 measured: 5.7 dB more SNR, a maximum error of 64 against 2910, and no clipped
 sample against 4432. At 15 dB it sends 1.85× fewer bytes than int8 and gives up
-5.6 dB of SNR to do it — which is the point rather than a defect: the margin it
-was asked for is the margin it holds, and 15 dB is the aggressive end of the
-range on purpose.
+5.6 dB of SNR to do it, and at 10 dB 2.23× fewer for 10.5 dB — which is the
+point rather than a defect: the margin it was asked for is the margin it holds,
+and the lower arms trade SNR for bytes on purpose.
 
 The max-error column is the clearest statement of the difference in kind. A
 margin-based quantiser rounds and never clips, so its worst case is exactly half
 a step of the coarsest packet it sent: 64 at 26 dB, where the coarsest shift was
-7, and 256 at 15 dB, where it was 9. Both are arithmetic, not luck. SDR++'s
+7, 256 at 15 dB, where it was 9, and 512 at 10 dB, where it was 10. All three
+are arithmetic, not luck. SDR++'s
 2910 is a rail: the scaler is the largest *signed* value in the block, so any
 sample more negative than that is clipped outright, 4432 times on this capture.
 The `peak fixed` variant removes exactly that fault, and cheaply: 0.9 µs per
@@ -202,26 +205,30 @@ int16:
 | SDR++ float32 + zstd-1 | 2207.4 | 0.696× | 1874.1 | 0.820× | **UberSDR-IQ** — 1.9–2.3× fewer bytes, both exact |
 | SDR++ int16 (server default) | 1553.1 | 0.989× | 1553.1 | 0.989× | **UberSDR-IQ** — 1.6× fewer bytes *and* exact |
 | SDR++ int16 + zstd-1 | 1563.7 | 0.982× | 1559.7 | 0.985× | **UberSDR-IQ** — 1.6× fewer bytes *and* exact |
-| SDR++ int8 | 785.1 | 1.957× | 785.1 | 1.957× | split — **UberSDR-IQ at 26 dB** on the busy band, SDR++ by 0.95% on medium wave |
+| SDR++ int8 | 785.1 | 1.957× | 785.1 | 1.957× | **UberSDR-IQ** — at 26 dB on the busy band; on medium wave only at 10 dB, by 5.6% (SDR++ beats our 15 dB arm by 0.95%) |
 | SDR++ int8 + zstd-1 | 795.7 | 1.930× | 794.0 | 1.934× | **UberSDR-IQ at 26 dB** on the busy band; at 15 dB on both |
 | **UberSDR-IQ (lossless)** | **975.2** | **1.575×** | **970.1** | **1.583×** | — |
 | **UberSDR-IQ, 26 dB margin** | **880.2** | **1.745×** | **600.2** | **2.559×** | — |
 | **UberSDR-IQ, 15 dB margin** | **792.6** | **1.938×** | **443.3** | **3.465×** | — |
+| **UberSDR-IQ, 10 dB margin** | **741.5** | **2.071×** | **373.1** | **4.117×** | — |
 
-**Medium wave is the loss, and it is a real one.** Asked for 26 dB there, the
-policy takes a mean shift of 1.01 — barely any reduction at all — and saves
-9.7%; at 15 dB it takes 1.96 and saves 18.7%, ending at 792.6 kB/s against
-int8's 785.1. SDR++ sends 0.95% fewer bytes. It does so at a 3.0 dB margin and a
-1.78 dB rise in the band's own noise floor, against 35.6 dB and 0.00 dB, so the
-two are not really trading the same thing — but on the byte count alone, on that
-capture, int8 wins and the table says so. Medium wave carriers sit 67.6 dB above
+**Medium wave is where int8 comes closest, and it takes the floor of the range
+to beat it.** Asked for 26 dB there, the policy takes a mean shift of 1.01 —
+barely any reduction at all — and saves 9.7%; at 15 dB it takes 1.96 and saves
+18.7%, ending at 792.6 kB/s against int8's 785.1, so SDR++ sends 0.95% fewer
+bytes than that arm. At 10 dB it takes 2.66, saves 24.0% and ends at 741.5 kB/s,
+5.6% under int8. int8 gets there at a 3.0 dB margin and a 1.78 dB rise in the
+band's own noise floor, against 31.1 dB and 0.00 dB at our 10 dB arm, so the two
+are not really trading the same thing — and the 31.1 dB is an overshoot the next
+section explains, not a margin the policy aimed for. Medium wave carriers sit 67.6 dB above
 the noise and genuinely need the depth; SPEC.md §6.6.4 records the same result
 from the other direction, 15.6% saved at a 20 dB request where a quiet band
 saves 60.6%.
 
-On the busy amateur band the reduced-depth arms save 38.1% and 54.3% against our
-own lossless mode, and 600.2 kB/s at 26 dB is 1.31× smaller than int8's 785.1.
-On the 48 kHz capture the same two arms save 43.0% and 59.9%.
+On the busy amateur band the reduced-depth arms save 38.1%, 54.3% and 61.5%
+against our own lossless mode, and 600.2 kB/s at 26 dB is 1.31× smaller than
+int8's 785.1. On the 48 kHz capture the same three arms save 43.0%, 59.9% and
+66.7%.
 
 The SDR++ integer modes return a fixed ratio set by the word size — 0.989× and
 1.957× on every capture — because requantisation cannot know anything about the
@@ -254,22 +261,25 @@ added; `headroom` is the strongest signal in the band above the error floor.
 | | | SDR++ int8, peak fixed | 28.2 dB | 0.01 dB | 72.8 dB |
 | | | **UberSDR-IQ, 26 dB asked** | **30.3 dB** | **0.00 dB** | **74.9 dB** |
 | | | **UberSDR-IQ, 15 dB asked** | **19.1 dB** | 0.05 dB | 63.7 dB |
+| | | **UberSDR-IQ, 10 dB asked** | **14.2 dB** | 0.16 dB | 58.8 dB |
 | `iq-384k` busy band | 37.8 dB | SDR++ int16 (default) | 22.8 dB | 0.02 dB | 60.5 dB |
 | | | SDR++ int16, peak fixed | — | 0.00 dB | bit exact |
 | | | SDR++ int8 | 22.2 dB | 0.03 dB | 60.0 dB |
 | | | SDR++ int8, peak fixed | 30.8 dB | 0.00 dB | 68.6 dB |
 | | | **UberSDR-IQ, 26 dB asked** | **28.2 dB** | 0.01 dB | 66.0 dB |
 | | | **UberSDR-IQ, 15 dB asked** | **16.5 dB** | 0.10 dB | 54.3 dB |
+| | | **UberSDR-IQ, 10 dB asked** | **12.0 dB** | 0.27 dB | 49.8 dB |
 | `iq-384k-mw` medium wave | 67.6 dB | SDR++ int16 (default) | 4.6 dB | 1.29 dB | 72.2 dB |
 | | | SDR++ int16, peak fixed | — | 0.00 dB | bit exact |
 | | | SDR++ int8 | 3.0 dB | 1.78 dB | 70.6 dB |
 | | | SDR++ int8, peak fixed | 7.5 dB | 0.71 dB | 75.1 dB |
 | | | **UberSDR-IQ, 26 dB asked** | **42.4 dB** | **0.00 dB** | **110.0 dB** |
 | | | **UberSDR-IQ, 15 dB asked** | **35.6 dB** | **0.00 dB** | **103.2 dB** |
+| | | **UberSDR-IQ, 10 dB asked** | **31.1 dB** | **0.00 dB** | **98.7 dB** |
 
 Read the `margin` column against what each mode was asked for and the difference
 between the two approaches is the whole story. **Every UberSDR-IQ row delivers at
-least the margin requested, on every capture, and none of the six undershoots.**
+least the margin requested, on every capture, and none of the nine undershoots.**
 That is the direction to be wrong in: the closed-form estimate in
 `margin_rule.py` spends bits where it is uncertain and never withholds them.
 
@@ -277,15 +287,19 @@ How far each overshoots depends on how much of the capture the estimator got to
 see, and the three captures are not comparable on that point. Peakiness refreshes
 on a 100 ms cadence over a 1 s window. The 48 kHz capture is 30 s, so it takes
 **300** readings and only its first 3 packets fall back to the "assume the worst"
-60 dB default; its margins land at +4.3 and +4.1 dB over the request, which is
-the figure to quote for a running stream. The 384 kHz vectors are 0.075 s long,
+60 dB default; its margins land at +4.3, +4.1 and +4.2 dB over the request,
+which is the figure to quote for a running stream. The 384 kHz vectors are 0.075 s long,
 so **exactly one** reading is ever taken — from the first 3 ms — and held for all
 80 packets, with the first 2 on the fallback. Those two run open-loop: the busy
-band still lands close, +2.2 and +1.5 dB, and medium wave overshoots by 16.4 and
-20.6 dB. **The medium wave figures are therefore not evidence that the policy
+band still lands close, +2.2, +1.5 and +2.0 dB, and medium wave overshoots by
+16.4, 20.6 and 21.1 dB. **The medium wave figures are therefore not evidence that the policy
 tracks that band well — they are what a single 3 ms reading of it produced, and
 the bytes in the previous table are what that reading cost.** A 30 s medium wave
 capture would settle it; none was taken, so it is not claimed.
+
+The price of the lowest arm is visible in the `floor rise` column: 0.16 dB on
+the 48 kHz capture and 0.27 dB on the busy band, against 0.05 and 0.10 at 15 dB.
+That is the 0.4 dB a 10 dB margin allows on paper, less the overshoot.
 
 The SDR++ rows have no such column to check against, because there is nothing to
 ask for. Per-block adaptive gain buys the 8-bit modes roughly 70–75 dB of usable
@@ -330,6 +344,13 @@ columns that move:
 | **UberSDR-IQ (lossless)** | **26.2** | **27.9** | **24** | **3.93** | **0.393%** | **14.15 (13.65–15.08)** | **255** | — |
 | **UberSDR-IQ, 26 dB margin** | **26.8** | **28.1** | **24** | **4.02** | **0.402%** | **14.48 (14.22–14.94)** | **249** | — |
 | **UberSDR-IQ, 15 dB margin** | **26.8** | **28.1** | **24** | **4.01** | **0.401%** | **14.45 (14.08–15.07)** | **249** | — |
+
+The 10 dB arm is not in this table or the timing tables below. It was added on
+2026-09-30, after these runs, and on a part whose clock moved 1328–2502 MHz
+between runs a row from another day would not be comparable. One run that day,
+with nothing else timed, put it at 14.11 CPU-s/h against 14.56 for the 15 dB arm
+and 13.65 lossless — the same as the other arms, as the next paragraph says it
+must be.
 
 Two things to take from it.
 
@@ -441,6 +462,9 @@ the convert rows there are the optimistic end of what that plateau allows.
     governor `performance`
     Linux 6.8, 2026-09-05, three full runs of ./run.sh between 13:16 and 13:34
 
+The 10 dB rows in the byte and fidelity tables are from 2026-09-30. Those tables
+are deterministic, and the same run reproduced every other row in them exactly.
+
 `bench` prints the model, logical CPU count and the mean clock sampled while it
 ran, so figures from another machine carry the context needed to compare them.
 Timings are averaged over repeated passes — five on the 30 s capture, 200 on the
@@ -474,11 +498,11 @@ normally runs on, holds a higher all-core clock than this one does.
 | dimension | winner | by how much |
 |---|---|---|
 | Bytes, lossless against lossless | **UberSDR-IQ** | 1.47× smaller than a magnitude-scaled int16, 2.9× smaller than the float32 mode SDR++ ships |
-| Bytes, lossy against lossy, 48 kHz | **UberSDR-IQ** | 1.30× smaller than int8 at the default 26 dB margin, and better than it on every fidelity axis at the same time; 1.85× smaller at 15 dB, trading 5.6 dB of SNR for it |
-| Bytes, lossy against lossy, medium wave | SDR++ int8 | 0.95% smaller than our 15 dB arm, at a 3.0 dB margin against 35.6 dB |
+| Bytes, lossy against lossy, 48 kHz | **UberSDR-IQ** | 1.30× smaller than int8 at the default 26 dB margin, and better than it on every fidelity axis at the same time; 1.85× smaller at 15 dB, trading 5.6 dB of SNR for it, and 2.23× at 10 dB for 10.5 dB |
+| Bytes, lossy against lossy, medium wave | **UberSDR-IQ at 10 dB** | 5.6% smaller than int8, at a 31.1 dB margin against 3.0 dB; int8 is 0.95% smaller than our 15 dB arm |
 | Fidelity, lossless | **UberSDR-IQ** | exact on every capture; nothing to tune, nothing to check |
 | Fidelity, lossy | **UberSDR-IQ** | holds a stated margin on every capture and clips nothing; int8 clips 4432 samples on the 48 kHz capture and promises no margin at all |
-| Adapts to the signal | **UberSDR-IQ** | 1.448×–1.583× lossless as the band changes, 1.745×–3.607× reduced-depth, against a fixed 0.989× or 1.957× |
+| Adapts to the signal | **UberSDR-IQ** | 1.448×–1.583× lossless as the band changes, 1.745×–4.341× reduced-depth, against a fixed 0.989× or 1.957× |
 | Noise floor kept, medium wave | **UberSDR-IQ** | 0.71–1.78 dB under requantisation; 0.00 dB under a margin request |
 | Scales across cores | **UberSDR-IQ** | 5.8× on 8 cores / 16 threads; the convert modes hit a memory ceiling at four |
 | Whole-machine capacity | ample either way | 1380 concurrent 48 kHz or 167–180 concurrent 384 kHz sessions, measured saturated |
@@ -497,8 +521,9 @@ make to int8 no longer holds on either count. At the reference sender's default
 margin UberSDR-IQ sends 1.30× fewer bytes on the 48 kHz capture and 1.31× fewer
 on the busy 384 kHz band, and it does so while holding a margin the client asked
 for and clipping nothing, where int8 rails 4432 samples and offers no promise
-about what survives. Medium wave is the exception and int8 keeps it by 0.95%,
-because carriers 67.6 dB over the noise genuinely need the depth.
+about what survives. Medium wave is the close one: int8 beats our 15 dB arm by
+0.95%, because carriers 67.6 dB over the noise genuinely need the depth, and it
+takes the 10 dB floor of the range to come in under int8, by 5.6%.
 
 Three things go the other way, and all are bounded. UberSDR-IQ costs 0.39% of
 one core per 48 kHz session and 3.1–3.4% per 384 kHz session — 14 CPU-seconds

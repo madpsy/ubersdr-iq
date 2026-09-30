@@ -33,11 +33,11 @@ decibels rather than a bit depth — how far below the band's own noise floor th
 quantisation floor must stay — and the sender picks the depth that honours it,
 per packet. At the reference default of 26 dB:
 
-| stream | lossless | 26 dB margin | 15 dB margin |
-|---|---|---|---|
-| IQ, 384 kHz, quiet band | 1.54× | 2.91× (+30.2 dB) | 4.42× (+18.4 dB) |
-| IQ, 384 kHz, busy band | 1.48× | 2.45× (+28.9 dB) | 3.40× (+18.0 dB) |
-| IQ, 12 kHz (`iq` mode) | 1.38× | 2.32× (+28.6 dB) | 3.18× (+17.9 dB) |
+| stream | lossless | 26 dB margin | 15 dB margin | 10 dB margin |
+|---|---|---|---|---|
+| IQ, 384 kHz, quiet band | 1.54× | 2.91× (+30.2 dB) | 4.41× (+18.4 dB) | 5.46× (+13.9 dB) |
+| IQ, 384 kHz, busy band | 1.48× | 2.45× (+28.9 dB) | 3.40× (+18.0 dB) | 4.14× (+13.3 dB) |
+| IQ, 12 kHz (`iq` mode) | 1.38× | 2.32× (+28.6 dB) | 3.18× (+17.9 dB) | 3.79× (+12.6 dB) |
 
 The margin delivered is always at least the margin asked for. On a band too
 peaky to afford a coarser quantiser the sender returns a shift of zero and the
