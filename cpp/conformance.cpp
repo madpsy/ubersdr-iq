@@ -378,6 +378,90 @@ void TestScaled() {
 
 }  // namespace
 
+// The SIMD block path against Forward and Inverse frame by frame, over
+// packets from one frame up, from silence to full scale, and on the decode
+// side residuals near +-2^31 that take a sample past int32 and the kernel's
+// early stop. The two stages must produce the same output on every packet,
+// which they cannot unless their state also agrees.
+void TestBlock() {
+    uint64_t seed = 31;
+    auto rnd = [&seed](uint64_t n) {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+        return (seed >> 33) % n;
+    };
+    size_t simd_frames = 0;
+    for (int trial = 0; trial < 40 && !failures; trial++) {
+        uiq::detail::ComplexStage want(16, 16), got(16, 16);
+        for (int p = 0; p < 40 && !failures; p++) {
+            const size_t frames = 1 + rnd(400);
+            want.BeginPacket(static_cast<int>(frames));
+            got.BeginPacket(static_cast<int>(frames));
+            if (rnd(2)) {
+                const int amp = std::vector<int>{0, 1, 3, 300, 32768}[rnd(5)];
+                std::vector<int16_t> in(2 * frames);
+                for (auto& v : in) {
+                    if (amp == 32768) v = static_cast<int16_t>(static_cast<int>(rnd(65536)) - 32768);
+                    else if (amp > 0) v = static_cast<int16_t>(static_cast<int>(rnd(2 * amp + 1)) - amp);
+                }
+                std::vector<int32_t> a(in.size()), b(in.size());
+                for (size_t i = 0; i < in.size(); i += 2) {
+                    int64_t er, ei;
+                    want.Forward(in[i], in[i + 1], &er, &ei);
+                    a[i] = static_cast<int32_t>(er);
+                    a[i + 1] = static_cast<int32_t>(ei);
+                }
+                const size_t done = got.ForwardBlock(in.data(), b.data(), frames);
+                simd_frames += done;
+                for (size_t i = 2 * done; i < in.size(); i += 2) {
+                    int64_t er, ei;
+                    got.Forward(in[i], in[i + 1], &er, &ei);
+                    b[i] = static_cast<int32_t>(er);
+                    b[i + 1] = static_cast<int32_t>(ei);
+                }
+                Check(a == b, "block forward differs from per-frame forward");
+            } else {
+                const bool huge = rnd(4) == 0;
+                std::vector<int32_t> in(2 * frames);
+                for (auto& v : in) {
+                    if (huge && rnd(50) == 0) {
+                        v = static_cast<int32_t>(INT32_MAX - static_cast<int32_t>(rnd(1000)));
+                        if (rnd(2)) v = -v - 1;
+                    } else {
+                        v = static_cast<int32_t>(rnd(2001)) - 1000;
+                    }
+                }
+                std::vector<int16_t> a(in.size()), b(in.size());
+                for (size_t i = 0; i < in.size(); i += 2) {
+                    int64_t xr, xi;
+                    want.Inverse(in[i], in[i + 1], &xr, &xi);
+                    a[i] = static_cast<int16_t>(xr);
+                    a[i + 1] = static_cast<int16_t>(xi);
+                }
+                const size_t done = got.InverseBlock(in.data(), b.data(), frames);
+                simd_frames += done;
+                for (size_t i = 2 * done; i < in.size(); i += 2) {
+                    int64_t xr, xi;
+                    got.Inverse(in[i], in[i + 1], &xr, &xi);
+                    b[i] = static_cast<int16_t>(xr);
+                    b[i + 1] = static_cast<int16_t>(xi);
+                }
+                Check(a == b, "block inverse differs from per-frame inverse");
+            }
+        }
+    }
+    std::printf("  block            %s, %zu frames through it\n",
+                simd_frames ? "SIMD kernel matches per-frame" : "no SIMD kernel in this build",
+                simd_frames);
+}
+
+// TestVectors again with the SIMD kernel off, so the per-frame path is held to
+// the vectors on a machine that has one.
+void TestVectorsNoSimd(const std::string& dir) {
+    uiq::detail::SimdEnabled() = false;
+    TestVectors(dir);
+    uiq::detail::SimdEnabled() = true;
+}
+
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "testdata";
     std::printf("conformance against %s\n", dir.c_str());
@@ -388,6 +472,8 @@ int main(int argc, char** argv) {
     TestSilence();
     TestUnknownProfile();
     TestScaled();
+    TestBlock();
+    TestVectorsNoSimd(dir);
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;

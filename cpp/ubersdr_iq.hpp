@@ -51,6 +51,20 @@
 #include <string>
 #include <vector>
 
+// SIMD kernels for the order-16 complex stage, every IQ profile's predictor.
+// AVX2 on x86-64 with GCC or Clang, chosen at run time so no -mavx2 is needed;
+// NEON on arm64, which every core has. Elsewhere, or with UBERSDR_IQ_NO_SIMD
+// defined, the per-frame path runs, with the same output.
+#if !defined(UBERSDR_IQ_NO_SIMD)
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define UBERSDR_IQ_AVX2 1
+#include <immintrin.h>
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#define UBERSDR_IQ_NEON 1
+#include <arm_neon.h>
+#endif
+#endif
+
 namespace ubersdr_iq {
 
 // ---------------------------------------------------------------------------
@@ -488,6 +502,245 @@ inline int64_t ClampTap(int64_t w) {
 // amortises away. An implementation choice: it changes nothing transmitted.
 inline int HistoryLen(int order) { return std::max(order * 8, 64); }
 
+// The order-16 complex stage as the SIMD kernels hold it: taps and the newest
+// 16 history samples, oldest first, in int32.
+//
+// int32 is exact: a tap never leaves +-kTapLimit (2^24) -- the kernels always
+// clamp, which where the scalar code skips the clamp is an identity -- and the
+// products are formed in int64 lanes. A history sample outside int32 can only
+// come from a corrupt stream; the kernels are not used while one is in the
+// window, and the decoder stops before taking one in.
+struct Cx16State {
+    int32_t wr[16], wi[16];
+    int32_t hr[16], hi[16];
+};
+
+// Lets a test hold the per-frame path to the same output as the kernels.
+inline bool& SimdEnabled() {
+    static bool on = true;
+    return on;
+}
+
+// Each kernel runs whole frames of the stage in one direction: given samples
+// (xin) it writes residuals (rout), given residuals (rin) it writes samples
+// (xout). Per frame, as Forward and Inverse: predict from the window, form the
+// residual or the sample, adapt against the window's signs, then slide the
+// window a lane with the sample in at the top. They return how many frames
+// they did.
+
+#if defined(UBERSDR_IQ_AVX2)
+__attribute__((target("avx2")))
+inline size_t Cx16AVX2(Cx16State* st, const int16_t* xin, const int32_t* rin,
+                       int16_t* xout, int32_t* rout, size_t frames, int64_t mu) {
+    __m256i hr0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&st->hr[0]));
+    __m256i hr1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&st->hr[8]));
+    __m256i hi0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&st->hi[0]));
+    __m256i hi1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&st->hi[8]));
+    __m256i wr0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&st->wr[0]));
+    __m256i wr1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&st->wr[8]));
+    __m256i wi0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&st->wi[0]));
+    __m256i wi1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&st->wi[8]));
+    const __m256i rot = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 0);
+    const __m256i lim = _mm256_set1_epi32(static_cast<int32_t>(kTapLimit));
+    const __m256i nlim = _mm256_set1_epi32(-static_cast<int32_t>(kTapLimit));
+    size_t f = 0;
+    for (; f < frames; ++f) {
+        // Even lanes multiply directly, odd ones once shifted down: VPMULDQ
+        // reads only the low half of each quadword.
+        const __m256i wr0o = _mm256_srli_epi64(wr0, 32), wr1o = _mm256_srli_epi64(wr1, 32);
+        const __m256i wi0o = _mm256_srli_epi64(wi0, 32), wi1o = _mm256_srli_epi64(wi1, 32);
+        const __m256i hr0o = _mm256_srli_epi64(hr0, 32), hr1o = _mm256_srli_epi64(hr1, 32);
+        const __m256i hi0o = _mm256_srli_epi64(hi0, 32), hi1o = _mm256_srli_epi64(hi1, 32);
+        __m256i accR = _mm256_add_epi64(
+            _mm256_add_epi64(_mm256_mul_epi32(wr0, hr0), _mm256_mul_epi32(wr0o, hr0o)),
+            _mm256_add_epi64(_mm256_mul_epi32(wr1, hr1), _mm256_mul_epi32(wr1o, hr1o)));
+        accR = _mm256_sub_epi64(accR, _mm256_add_epi64(
+            _mm256_add_epi64(_mm256_mul_epi32(wi0, hi0), _mm256_mul_epi32(wi0o, hi0o)),
+            _mm256_add_epi64(_mm256_mul_epi32(wi1, hi1), _mm256_mul_epi32(wi1o, hi1o))));
+        __m256i accI = _mm256_add_epi64(
+            _mm256_add_epi64(_mm256_mul_epi32(wr0, hi0), _mm256_mul_epi32(wr0o, hi0o)),
+            _mm256_add_epi64(_mm256_mul_epi32(wr1, hi1), _mm256_mul_epi32(wr1o, hi1o)));
+        accI = _mm256_add_epi64(accI, _mm256_add_epi64(
+            _mm256_add_epi64(_mm256_mul_epi32(wi0, hr0), _mm256_mul_epi32(wi0o, hr0o)),
+            _mm256_add_epi64(_mm256_mul_epi32(wi1, hr1), _mm256_mul_epi32(wi1o, hr1o))));
+        const __m128i sR = _mm_add_epi64(_mm256_castsi256_si128(accR), _mm256_extracti128_si256(accR, 1));
+        const __m128i sI = _mm_add_epi64(_mm256_castsi256_si128(accI), _mm256_extracti128_si256(accI, 1));
+        const __m128i sum = _mm_add_epi64(_mm_unpacklo_epi64(sR, sI), _mm_unpackhi_epi64(sR, sI));
+        const int64_t qr = RoundShift(_mm_cvtsi128_si64(sum), kTapShift);
+        const int64_t qi = RoundShift(_mm_extract_epi64(sum, 1), kTapShift);
+
+        int64_t xr, xi, er, ei;
+        if (rin) {
+            er = rin[2 * f];
+            ei = rin[2 * f + 1];
+            xr = er + qr;
+            xi = ei + qi;
+            if (xr < INT32_MIN || xr > INT32_MAX || xi < INT32_MIN || xi > INT32_MAX) break;
+            xout[2 * f] = static_cast<int16_t>(xr);
+            xout[2 * f + 1] = static_cast<int16_t>(xi);
+        } else {
+            xr = xin[2 * f];
+            xi = xin[2 * f + 1];
+            er = xr - qr;
+            ei = xi - qi;
+            rout[2 * f] = static_cast<int32_t>(er);
+            rout[2 * f + 1] = static_cast<int32_t>(ei);
+        }
+
+        if (er != 0 || ei != 0) {
+            const __m256i mr = _mm256_set1_epi32(static_cast<int32_t>(mu * Sign(er)));
+            const __m256i mi = _mm256_set1_epi32(static_cast<int32_t>(mu * Sign(ei)));
+            // wr += mr*sgn(hr) + mi*sgn(hi) - leak(wr), wi += mi*sgn(hr) -
+            // mr*sgn(hi) - leak(wi), clamped; leak is |w| >> 14 with w's sign.
+#define UBERSDR_IQ_ADAPT(wr, wi, hr, hi)                                                       \
+            {                                                                                  \
+                const __m256i lr = _mm256_sign_epi32(                                          \
+                    _mm256_srli_epi32(_mm256_abs_epi32(wr), kLeakShiftComplex), wr);           \
+                const __m256i li = _mm256_sign_epi32(                                          \
+                    _mm256_srli_epi32(_mm256_abs_epi32(wi), kLeakShiftComplex), wi);           \
+                const __m256i nr = _mm256_sub_epi32(_mm256_add_epi32(wr, _mm256_add_epi32(     \
+                    _mm256_sign_epi32(mr, hr), _mm256_sign_epi32(mi, hi))), lr);               \
+                const __m256i ni = _mm256_sub_epi32(_mm256_add_epi32(wi, _mm256_sub_epi32(     \
+                    _mm256_sign_epi32(mi, hr), _mm256_sign_epi32(mr, hi))), li);               \
+                wr = _mm256_max_epi32(_mm256_min_epi32(nr, lim), nlim);                        \
+                wi = _mm256_max_epi32(_mm256_min_epi32(ni, lim), nlim);                        \
+            }
+            UBERSDR_IQ_ADAPT(wr0, wi0, hr0, hi0)
+            UBERSDR_IQ_ADAPT(wr1, wi1, hr1, hi1)
+#undef UBERSDR_IQ_ADAPT
+        }
+
+        const __m256i r0 = _mm256_permutevar8x32_epi32(hr0, rot), r1 = _mm256_permutevar8x32_epi32(hr1, rot);
+        const __m256i i0 = _mm256_permutevar8x32_epi32(hi0, rot), i1 = _mm256_permutevar8x32_epi32(hi1, rot);
+        hr0 = _mm256_blend_epi32(r0, r1, 0x80);
+        hi0 = _mm256_blend_epi32(i0, i1, 0x80);
+        hr1 = _mm256_blend_epi32(r1, _mm256_set1_epi32(static_cast<int32_t>(xr)), 0x80);
+        hi1 = _mm256_blend_epi32(i1, _mm256_set1_epi32(static_cast<int32_t>(xi)), 0x80);
+    }
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&st->wr[0]), wr0);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&st->wr[8]), wr1);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&st->wi[0]), wi0);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&st->wi[8]), wi1);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&st->hr[0]), hr0);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&st->hr[8]), hr1);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&st->hi[0]), hi0);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(&st->hi[8]), hi1);
+    return f;
+}
+#endif
+
+#if defined(UBERSDR_IQ_NEON)
+inline size_t Cx16NEON(Cx16State* st, const int16_t* xin, const int32_t* rin,
+                       int16_t* xout, int32_t* rout, size_t frames, int64_t mu) {
+    int32x4_t hr[4], hi[4], wr[4], wi[4];
+    for (int k = 0; k < 4; ++k) {
+        hr[k] = vld1q_s32(&st->hr[4 * k]);
+        hi[k] = vld1q_s32(&st->hi[4 * k]);
+        wr[k] = vld1q_s32(&st->wr[4 * k]);
+        wi[k] = vld1q_s32(&st->wi[4 * k]);
+    }
+    const int32x4_t lim = vdupq_n_s32(static_cast<int32_t>(kTapLimit));
+    const int32x4_t nlim = vdupq_n_s32(-static_cast<int32_t>(kTapLimit));
+    size_t f = 0;
+    for (; f < frames; ++f) {
+        // Two accumulators a part, each a pair of int64 lanes, so the
+        // multiply-accumulates are not all one chain.
+        int64x2_t ar0 = vmull_s32(vget_low_s32(wr[0]), vget_low_s32(hr[0]));
+        int64x2_t ar1 = vmull_high_s32(wr[0], hr[0]);
+        int64x2_t ai0 = vmull_s32(vget_low_s32(wr[0]), vget_low_s32(hi[0]));
+        int64x2_t ai1 = vmull_high_s32(wr[0], hi[0]);
+        ar0 = vmlsl_s32(ar0, vget_low_s32(wi[0]), vget_low_s32(hi[0]));
+        ar1 = vmlsl_high_s32(ar1, wi[0], hi[0]);
+        ai0 = vmlal_s32(ai0, vget_low_s32(wi[0]), vget_low_s32(hr[0]));
+        ai1 = vmlal_high_s32(ai1, wi[0], hr[0]);
+        for (int k = 1; k < 4; ++k) {
+            ar0 = vmlal_s32(ar0, vget_low_s32(wr[k]), vget_low_s32(hr[k]));
+            ar1 = vmlal_high_s32(ar1, wr[k], hr[k]);
+            ai0 = vmlal_s32(ai0, vget_low_s32(wr[k]), vget_low_s32(hi[k]));
+            ai1 = vmlal_high_s32(ai1, wr[k], hi[k]);
+            ar0 = vmlsl_s32(ar0, vget_low_s32(wi[k]), vget_low_s32(hi[k]));
+            ar1 = vmlsl_high_s32(ar1, wi[k], hi[k]);
+            ai0 = vmlal_s32(ai0, vget_low_s32(wi[k]), vget_low_s32(hr[k]));
+            ai1 = vmlal_high_s32(ai1, wi[k], hr[k]);
+        }
+        const int64_t qr = RoundShift(vaddvq_s64(vaddq_s64(ar0, ar1)), kTapShift);
+        const int64_t qi = RoundShift(vaddvq_s64(vaddq_s64(ai0, ai1)), kTapShift);
+
+        int64_t xr, xi, er, ei;
+        if (rin) {
+            er = rin[2 * f];
+            ei = rin[2 * f + 1];
+            xr = er + qr;
+            xi = ei + qi;
+            if (xr < INT32_MIN || xr > INT32_MAX || xi < INT32_MIN || xi > INT32_MAX) break;
+            xout[2 * f] = static_cast<int16_t>(xr);
+            xout[2 * f + 1] = static_cast<int16_t>(xi);
+        } else {
+            xr = xin[2 * f];
+            xi = xin[2 * f + 1];
+            er = xr - qr;
+            ei = xi - qi;
+            rout[2 * f] = static_cast<int32_t>(er);
+            rout[2 * f + 1] = static_cast<int32_t>(ei);
+        }
+
+        if (er != 0 || ei != 0) {
+            const int32_t mr = static_cast<int32_t>(mu * Sign(er));
+            const int32_t mi = static_cast<int32_t>(mu * Sign(ei));
+            for (int k = 0; k < 4; ++k) {
+                // Signs as -1/0/+1: the (h < 0) mask less the (h > 0) mask,
+                // each all ones where it holds.
+                const int32x4_t sr = vsubq_s32(vreinterpretq_s32_u32(vcltzq_s32(hr[k])),
+                                               vreinterpretq_s32_u32(vcgtzq_s32(hr[k])));
+                const int32x4_t si = vsubq_s32(vreinterpretq_s32_u32(vcltzq_s32(hi[k])),
+                                               vreinterpretq_s32_u32(vcgtzq_s32(hi[k])));
+                // Leak: |w| >> 14 with w's sign put back.
+                const int32x4_t gr = vshrq_n_s32(wr[k], 31), gi = vshrq_n_s32(wi[k], 31);
+                const int32x4_t lr = vsubq_s32(veorq_s32(vshrq_n_s32(vabsq_s32(wr[k]), kLeakShiftComplex), gr), gr);
+                const int32x4_t li = vsubq_s32(veorq_s32(vshrq_n_s32(vabsq_s32(wi[k]), kLeakShiftComplex), gi), gi);
+                const int32x4_t nr = vsubq_s32(vmlaq_n_s32(vmlaq_n_s32(wr[k], sr, mr), si, mi), lr);
+                const int32x4_t ni = vsubq_s32(vmlsq_n_s32(vmlaq_n_s32(wi[k], sr, mi), si, mr), li);
+                wr[k] = vmaxq_s32(vminq_s32(nr, lim), nlim);
+                wi[k] = vmaxq_s32(vminq_s32(ni, lim), nlim);
+            }
+        }
+
+        hr[0] = vextq_s32(hr[0], hr[1], 1);
+        hr[1] = vextq_s32(hr[1], hr[2], 1);
+        hr[2] = vextq_s32(hr[2], hr[3], 1);
+        hr[3] = vextq_s32(hr[3], vdupq_n_s32(static_cast<int32_t>(xr)), 1);
+        hi[0] = vextq_s32(hi[0], hi[1], 1);
+        hi[1] = vextq_s32(hi[1], hi[2], 1);
+        hi[2] = vextq_s32(hi[2], hi[3], 1);
+        hi[3] = vextq_s32(hi[3], vdupq_n_s32(static_cast<int32_t>(xi)), 1);
+    }
+    for (int k = 0; k < 4; ++k) {
+        vst1q_s32(&st->wr[4 * k], wr[k]);
+        vst1q_s32(&st->wi[4 * k], wi[k]);
+        vst1q_s32(&st->hr[4 * k], hr[k]);
+        vst1q_s32(&st->hi[4 * k], hi[k]);
+    }
+    return f;
+}
+#endif
+
+// Runs this machine's kernel, or returns 0 when it has none.
+inline size_t Cx16Kernel(Cx16State* st, const int16_t* xin, const int32_t* rin,
+                         int16_t* xout, int32_t* rout, size_t frames, int64_t mu) {
+    if (!SimdEnabled()) return 0;
+#if defined(UBERSDR_IQ_AVX2)
+    static const bool avx2 = [] {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2") != 0;
+    }();
+    if (avx2) return Cx16AVX2(st, xin, rin, xout, rout, frames, mu);
+#elif defined(UBERSDR_IQ_NEON)
+    return Cx16NEON(st, xin, rin, xout, rout, frames, mu);
+#endif
+    (void)st; (void)xin; (void)rin; (void)xout; (void)rout; (void)frames; (void)mu;
+    return 0;
+}
+
 // One adaptive complex filter, for interleaved I/Q.
 //
 // Sign-sign LMS rather than true NLMS: the update needs only the signs of the
@@ -531,7 +784,46 @@ public:
         AdaptAndPush(er, ei, *xr, *xi);
     }
 
+    // Forward and Inverse over up to frames I/Q frames at once through a SIMD
+    // kernel, returning how many were done: none for another order or with no
+    // kernel, fewer than asked if decoding met a sample past int32. The caller
+    // runs the rest frame by frame.
+    size_t ForwardBlock(const int16_t* x, int32_t* res, size_t frames) {
+        return Block(x, nullptr, nullptr, res, frames);
+    }
+    size_t InverseBlock(const int32_t* res, int16_t* x, size_t frames) {
+        return Block(nullptr, res, x, nullptr, frames);
+    }
+
 private:
+    size_t Block(const int16_t* xin, const int32_t* rin, int16_t* xout, int32_t* rout,
+                 size_t frames) {
+        if (order_ != 16 || frames == 0) return 0;
+        const int lo = idx_ - 16;
+        Cx16State st;
+        for (int j = 0; j < 16; j++) {
+            const int64_t r = hr_[lo + j], i = hi_[lo + j];
+            if (r < INT32_MIN || r > INT32_MAX || i < INT32_MIN || i > INT32_MAX) return 0;
+            st.wr[j] = static_cast<int32_t>(wr_[j]);
+            st.wi[j] = static_cast<int32_t>(wi_[j]);
+            st.hr[j] = static_cast<int32_t>(r);
+            st.hi[j] = static_cast<int32_t>(i);
+        }
+        const size_t done = Cx16Kernel(&st, xin, rin, xout, rout, frames, mu_);
+        if (done == 0) return 0;
+        // The window goes back at the front of the history.
+        for (int j = 0; j < 16; j++) {
+            wr_[j] = st.wr[j];
+            wi_[j] = st.wi[j];
+            hr_[j] = st.hr[j];
+            hi_[j] = st.hi[j];
+            sr_[j] = Sign(st.hr[j]);
+            si_[j] = Sign(st.hi[j]);
+        }
+        idx_ = 16;
+        return done;
+    }
+
     void Predict(int64_t* pr, int64_t* pi) const {
         const int lo = idx_ - order_;
         int64_t ar = 0, ai = 0;
@@ -880,7 +1172,7 @@ public:
 
         BeginPacket(static_cast<int>(n) / step);
         res_.resize(n);
-        for (size_t i = 0; i < n; i += step) {
+        for (size_t i = ForwardBlock(samples, res_.data(), n); i < n; i += step) {
             int64_t a = samples[i], b = step == 2 ? samples[i + 1] : 0;
             Forward(&a, &b);
             res_[i] = static_cast<int32_t>(a);
@@ -925,7 +1217,13 @@ public:
         if (count % static_cast<size_t>(step) != 0)
             return detail::Fail(err, "not a whole number of frames");
         BeginPacket(static_cast<int>(count) / step);
-        for (size_t i = 0; i < count; i += step) {
+        size_t done = 0;
+        if (complex_ && ncx_ == 1) {
+            zeros_.resize(count);
+            res_.resize(count);
+            done = ForwardBlock(zeros_.data(), res_.data(), count);
+        }
+        for (size_t i = done; i < count; i += step) {
             int64_t a = 0, b = 0;
             Forward(&a, &b);
         }
@@ -949,7 +1247,8 @@ public:
             // Advance the filters over these samples exactly as the encoder
             // did, discarding the residuals.
             BeginPacket(static_cast<int>(count) / step);
-            for (size_t i = 0; i < count; i += step) {
+            res_.resize(count);
+            for (size_t i = ForwardBlock(out->data(), res_.data(), count); i < count; i += step) {
                 int64_t a = (*out)[i], b = step == 2 ? (*out)[i + 1] : 0;
                 Forward(&a, &b);
             }
@@ -961,7 +1260,9 @@ public:
 
         BeginPacket(static_cast<int>(count) / step);
         if (complex_) {
-            for (size_t i = 0; i < count; i += 2) {
+            size_t done = 0;
+            if (ncx_ == 1) done = 2 * cx_[0].InverseBlock(res_.data(), out->data(), count / 2);
+            for (size_t i = done; i < count; i += 2) {
                 int64_t a = res_[i], b = res_[i + 1];
                 // Stages are inverted in reverse order: the last stage to have
                 // predicted is the first to be undone.
@@ -1008,6 +1309,14 @@ private:
         for (auto& s : rl_) s.BeginPacket(steps);
     }
 
+    // Runs a single-stage complex codec's encoder direction over a packet of n
+    // samples through the stage's block path, returning how many samples it
+    // did; the caller codes the rest one position at a time.
+    size_t ForwardBlock(const int16_t* samples, int32_t* res, size_t n) {
+        if (!complex_ || ncx_ != 1) return 0;
+        return 2 * cx_[0].ForwardBlock(samples, res, n / 2);
+    }
+
     // Run the cascade in the encoder direction over one sample position. Each
     // stage predicts the residual left by the one before it.
     void Forward(int64_t* a, int64_t* b) {
@@ -1031,6 +1340,7 @@ private:
     std::vector<detail::RealStage> rl_;
     int ncx_ = 0, nrl_ = 0;
     std::vector<int32_t> res_;
+    std::vector<int16_t> zeros_;  // AdvanceSilence's block input; never written
 };
 
 // The sender's default policy for which predictor to use. Nothing on the wire

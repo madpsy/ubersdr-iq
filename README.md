@@ -43,9 +43,10 @@ The margin delivered is always at least the margin asked for. On a band too
 peaky to afford a coarser quantiser the sender returns a shift of zero and the
 stream stays bit-exact, which is the promise working rather than failing.
 
-**Cost.** A 384 kHz IQ stream costs about 3.1% of one core to encode and the
-same to decode; the reduced-depth path costs the same as the lossless one to
-within 4%. Encode and decode are symmetric to within 7%, so a client pays what
+**Cost.** A 384 kHz IQ stream costs about 1.0–1.4% of one core to encode or
+decode on x86-64 with AVX2, 2.7% on a Raspberry Pi 5 with NEON, and about 3%
+where neither is used; the reduced-depth path costs the same as the lossless
+one to within 4%. Encode and decode cost about the same, so a client pays what
 the server pays.
 
 **Against FLAC.** A streaming codec cannot look ahead past the packet it is
